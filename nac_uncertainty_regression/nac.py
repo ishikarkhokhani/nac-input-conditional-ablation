@@ -4,6 +4,7 @@
 
 from contextlib import contextmanager
 from enum import Enum, auto
+import math
 
 import torch
 from torch._C import device
@@ -376,6 +377,34 @@ def _nac_forward(layer_activations: dict[str, torch.Tensor],
     )
 
 
+def _select_local_indices(query: torch.Tensor,
+                          reference_inputs: torch.Tensor,
+                          strategy: str,
+                          k: int,
+                          generator_seed: int) -> torch.Tensor:
+    n = reference_inputs.shape[0]
+    if n == 0:
+        return torch.zeros((0,), dtype=torch.long, device=query.device)
+    k_eff = min(max(int(k), 1), n)
+    distances = torch.cdist(query.detach(), reference_inputs.detach())
+    if strategy == "nearest":
+        return torch.topk(distances, k=k_eff, largest=False, dim=1).indices
+    if strategy == "farthest":
+        return torch.topk(distances, k=k_eff, largest=True, dim=1).indices
+    if strategy == "random":
+        out = []
+        for row_idx in range(query.shape[0]):
+            generator = torch.Generator(device=reference_inputs.device)
+            generator.manual_seed(int(generator_seed + row_idx))
+            perm = torch.randperm(n, generator=generator, device=reference_inputs.device)
+            out.append(perm[:k_eff])
+        return torch.stack(out, dim=0)
+    if strategy == "pooled":
+        pooled = torch.arange(n, device=reference_inputs.device)
+        return pooled.unsqueeze(0).repeat(query.shape[0], 1)
+    raise ValueError(f"Unsupported local neighbor strategy: {strategy}")
+
+
 class NACWrapper(torch.nn.Module):
 
     class ActivationCachingWrapper(torch.nn.Module):
@@ -433,7 +462,10 @@ class NACWrapper(torch.nn.Module):
                  confidence_cutoff: float = 0.1,
                  class_dimension: int = -1,
                  network_output_key: str | None = None,
-                 device: device | None = torch.device("cpu")) -> None:
+                 device: device | None = torch.device("cpu"),
+                 local_neighbor_strategy: str = "global",
+                 local_k: int = 8,
+                 local_random_seed: int = 0) -> None:
         """A Wrapper class to provide uncertainty estimations to trained models by building a distribution of neuron states
         for selected layers over I.D. data. Epistemic uncertainty can then be calculated for unseen data from the distribution.
         Hyperparameter search over [O, alpha, M] should be considered, as the values are strongly dataset-dependant.
@@ -486,6 +518,13 @@ class NACWrapper(torch.nn.Module):
             layer_name: torch.tensor(0, device=self.device)
             for layer_name in layer_name_list
         }
+        self.local_neighbor_strategy = local_neighbor_strategy
+        self.local_k = local_k
+        self.local_random_seed = local_random_seed
+        self.reference_inputs: list[torch.Tensor] = []
+        self.reference_uncertainty_inputs: list[torch.Tensor] = []
+        self.reference_uncertainty_scores: list[torch.Tensor] = []
+        self.last_uncertainty_details: dict[str, torch.Tensor | str | int] = {}
         self.train()
         self.stats_n = 0
         self.stats_sum: torch.Tensor = torch.tensor(0, device=self.device)
@@ -536,7 +575,58 @@ class NACWrapper(torch.nn.Module):
         self.stats_n = output_dict["stats_n"]
         self.stats_sum = output_dict["stats_sum"] # type: ignore
         self.stats_sum_squares = output_dict["stats_sum_squares"] # type: ignore
-        out["uncertainty"] = output_dict["uncertainty"]
+
+        if self.training:
+            self.reference_inputs.append(x.detach().to(self.device))
+            if self.local_neighbor_strategy != "global":
+                training_uncertainty = _compute_uncertainty(
+                    network_output=net_output_,
+                    layer_activations=layer_activations,
+                    stats_n=self.stats_n, # type: ignore[arg-type]
+                    stats_sum=self.stats_sum,
+                    stats_sum_squares=self.stats_sum_squares,
+                    layers_to_monitor=self.layers_to_monitor,
+                    alpha=self.alpha,
+                    network_output_key=self.network_output_key,
+                    mode=self.mode,
+                    class_dimension=self.class_dimension,
+                    histograms=self.histograms,
+                    M=self.M,
+                    O=self.O,
+                    device=self.device,
+                )
+                self.reference_uncertainty_inputs.append(x.detach().to(self.device))
+                self.reference_uncertainty_scores.append(training_uncertainty.detach())
+            out["uncertainty"] = output_dict["uncertainty"]
+            return out
+
+        uncertainty = output_dict["uncertainty"]
+        if self.local_neighbor_strategy != "global" and len(self.reference_uncertainty_inputs) > 0:
+            reference_inputs = torch.cat(self.reference_uncertainty_inputs, dim=0)
+            reference_scores = torch.cat(self.reference_uncertainty_scores, dim=0)
+            selected = _select_local_indices(
+                query=x.to(self.device),
+                reference_inputs=reference_inputs,
+                strategy=self.local_neighbor_strategy,
+                k=self.local_k,
+                generator_seed=self.local_random_seed,
+            )
+            gathered = reference_scores[selected]
+            local_mean = gathered.mean(dim=1)
+            uncertainty = torch.abs(uncertainty - local_mean) + 1.0 / (local_mean + 1e-6)
+            self.last_uncertainty_details = {
+                "strategy": self.local_neighbor_strategy,
+                "selected_index_count": torch.tensor(selected.shape[1], device=self.device),
+                "local_mean": local_mean.detach(),
+                "base_uncertainty": output_dict["uncertainty"].detach(),
+            }
+        else:
+            self.last_uncertainty_details = {
+                "strategy": "global",
+                "selected_index_count": torch.tensor(0, device=self.device),
+                "base_uncertainty": output_dict["uncertainty"].detach(),
+            }
+        out["uncertainty"] = uncertainty
         return out
 
     def _get_layer_activations_and_reset(self) -> dict[str, torch.Tensor]:

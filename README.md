@@ -49,6 +49,33 @@ If not using _UV_, install _python3.13_ and create the _.venv_ derived from the 
 For using only the NAC-Wrapper in your own project, we recommend doing ```uv add git+https://github.com/DLR-KI/nac-uncertainty-regression```.
 Alternatively you can simply copy ```nac_uncertainty_regression/nac.py``` into your project.
 
+For ablation-focused experiments, `NACWrapper` also accepts CPU-safe local scoring options: `local_neighbor_strategy` (`"global"`, `"nearest"`, `"random"`, `"farthest"`, or `"pooled"`), `local_k`, and `local_random_seed`. The default remains `"global"`, matching the original repository behavior.
+
+## Ablation experiment (ESANN 2027)
+
+This branch adds an input-conditional local scoring mode to `NACWrapper` together
+with the CPU-only verification suite used in our ESANN 2027 submission,
+*Input-Conditional Subspaces as a Local Alternative to Global Activation-Coverage
+Summaries for Uncertainty Estimation*.
+
+- `local_neighbor_strategy`: `"global"` (default, the original behaviour),
+  `"nearest"`, `"random"`, `"farthest"`, or `"pooled"`
+- `local_k`: neighbourhood size used by the local strategies
+- `local_random_seed`: sampling seed for the randomised strategies
+
+The baseline is this repository at commit `99e26dd95ca4`; the treatment and the
+tests below are the only additions.
+
+Reproduce the reported numbers (51 cases, CPU only, no GPU needed):
+
+```bash
+uv run python -m pytest -q -s tests/test_local_subspace_ablation.py
+```
+
+The suite prints `baseline_*`, `treatment_*`, and `negative_*` metric lines
+before it asserts, so every reported value can be checked from the command
+output alone.
+
 ## Usage (Minimum Runnable Example)
 
 ```python
